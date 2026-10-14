@@ -1,13 +1,13 @@
 name: release
 # Release CI for the Shaft Analyser, run here (a public repository: GitHub's Windows, Linux and macOS runners are free)
-# on the private source repository's main branch. Every 15 minutes (or on demand) it looks for a commit on main that
+# on the private source repository's main branch. Every 5 minutes (or on demand) it looks for a commit on main that
 # has no release yet; then: unit tests, build, install with the one-line command on clean Windows, Linux and macOS
 # (migrating a planted earlier install), self-check against ground truth, doctor, serve test, and only then publish a
 # release here, where installed copies pick it up on their own. A copy of the previous release must then update itself
 # to the new one on each platform. A failure opens an issue in the source repository and publishes nothing.
 on:
   schedule:
-    - cron: "*/15 * * * *"
+    - cron: "*/5 * * * *"
   workflow_dispatch:
     inputs:
       force:
