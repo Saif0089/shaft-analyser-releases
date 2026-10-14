@@ -1,0 +1,295 @@
+name: release
+# Release CI for the Shaft Analyser, run here (a public repository: GitHub's Windows, Linux and macOS runners are free)
+# on the private source repository's main branch. Every 15 minutes (or on demand) it looks for a commit on main that
+# has no release yet; then: unit tests, build, install with the one-line command on clean Windows, Linux and macOS
+# (migrating a planted earlier install), self-check against ground truth, doctor, serve test, and only then publish a
+# release here, where installed copies pick it up on their own. A copy of the previous release must then update itself
+# to the new one on each platform. A failure opens an issue in the source repository and publishes nothing.
+on:
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "Build even if main's commit already has a release"
+        type: boolean
+        default: false
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  issues: write
+
+env:
+  RELEASES_REPO: ${{ github.repository }}
+  SOURCE_REPO: Saif0089/delta_scan_shaft_analyser
+
+jobs:
+  decide:
+    runs-on: ubuntu-latest
+    outputs:
+      go: ${{ steps.d.outputs.go }}
+      sha: ${{ steps.d.outputs.sha }}
+      version: ${{ steps.d.outputs.version }}
+    steps:
+      - id: d
+        env:
+          GH_TOKEN: ${{ secrets.SOURCE_TOKEN }}
+          REL_TOKEN: ${{ github.token }}
+        run: |
+          sha=$(gh api "repos/$SOURCE_REPO/commits/main" -q .sha)
+          last=$(GH_TOKEN=$REL_TOKEN gh release view --repo "$RELEASES_REPO" --json body -q .body 2>/dev/null | grep -o 'Commit: [0-9a-f]\{40\}' | cut -d' ' -f2 || true)
+          base=$(gh api "repos/$SOURCE_REPO/contents/VERSION?ref=$sha" -q .content | base64 -d | tr -d '[:space:]')
+          n=$(GH_TOKEN=$REL_TOKEN gh release list --repo "$RELEASES_REPO" --limit 100 --json tagName -q '.[].tagName' | grep "^v$base\." | sed "s/^v$base\.//" | sort -n | tail -1)
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "version=v$base.$(( ${n:-0} + 1 ))" >> "$GITHUB_OUTPUT"
+          if [ "$sha" != "$last" ] || [ "${{ inputs.force }}" = "true" ]; then echo "go=true" >> "$GITHUB_OUTPUT"; else echo "go=false" >> "$GITHUB_OUTPUT"; fi
+          echo "main $sha · last released $last · next v$base.$(( ${n:-0} + 1 ))"
+
+  test:
+    needs: decide
+    if: needs.decide.outputs.go == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { repository: "${{ env.SOURCE_REPO }}", ref: "${{ needs.decide.outputs.sha }}", token: "${{ secrets.SOURCE_TOKEN }}" }
+      - uses: astral-sh/setup-uv@v6
+      - uses: actions/setup-go@v5
+        with: { go-version: "1.24" }
+      - name: Backend unit tests
+        working-directory: backend
+        run: uv sync --python 3.12 --frozen && uv run pytest -q
+      - name: Launcher tests
+        working-directory: launcher
+        run: go vet ./... && go test ./...
+
+  build:
+    needs: [decide, test]
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with: { repository: "${{ env.SOURCE_REPO }}", ref: "${{ needs.decide.outputs.sha }}", token: "${{ secrets.SOURCE_TOKEN }}" }
+      - uses: actions/setup-node@v4
+        with: { node-version: "24" }
+      - uses: actions/setup-go@v5
+        with: { go-version: "1.24" }
+      - uses: astral-sh/setup-uv@v6
+      - id: v
+        run: echo "version=${{ needs.decide.outputs.version }}" >> "$GITHUB_OUTPUT"
+      - name: Web app
+        working-directory: frontend
+        run: npm ci && npm run build
+      - name: Launchers
+        working-directory: launcher
+        run: |
+          mkdir -p ../dist-bin
+          # the Windows program carries the logo and its version (Explorer, taskbar, shortcuts)
+          go install github.com/tc-hib/go-winres@v0.3.3
+          V=${{ steps.v.outputs.version }}; V=${V#v}.0
+          "$(go env GOPATH)/bin/go-winres" simply --icon ../packaging/icons/logo-512.png --manifest cli \
+            --product-name "Shaft Analyser" --file-description "Shaft Analyser" --original-filename shaft-analyser.exe \
+            --copyright "Delta Scan Engineering" --product-version "$V" --file-version "$V"
+          for t in windows/amd64 linux/amd64 darwin/arm64; do
+            o=${t%/*}; a=${t#*/}; ext=; [ "$o" = windows ] && ext=.exe
+            GOOS=$o GOARCH=$a CGO_ENABLED=0 go build -trimpath -ldflags "-s -w -X main.Version=${{ steps.v.outputs.version }}" \
+              -o ../dist-bin/shaft-analyser-$o-$a$ext .
+          done
+      - name: Synthetic shaft
+        working-directory: backend
+        run: |
+          uv sync --python 3.12 --frozen --no-dev
+          uv run --no-dev python -c "from shaft.testing.synth import generate, SynthParams; generate('../synthetic_shaft.laz', SynthParams())"
+      - name: Package
+        run: python3 packaging/make_release.py ${{ steps.v.outputs.version }} dist dist-bin synthetic_shaft.laz
+      - uses: actions/upload-artifact@v4
+        with: { name: release, path: dist, retention-days: 14 }
+
+  verify:
+    needs: build
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: windows-latest, plat: windows-x64, exe: shaft-analyser.exe }
+          - { os: ubuntu-latest, plat: linux-x64, exe: shaft-analyser }
+          - { os: macos-14, plat: macos-arm64, exe: shaft-analyser }
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    env:
+      SHAFT_AUTO_UPDATE: "0"
+      SHAFT_NOTIFY: "0"
+    steps:
+      - uses: actions/download-artifact@v4
+        with: { name: release, path: dist }
+      - name: Serve the release locally (the installer downloads from it exactly as from GitHub)
+        shell: bash
+        run: |
+          PY=$(command -v python3 || command -v python)
+          cd dist && ("$PY" -m http.server 8011 --bind 127.0.0.1 > ../http.log 2>&1 &)
+          for i in $(seq 30); do curl -sf http://127.0.0.1:8011/checksums.txt > /dev/null && break; sleep 1; done
+      - name: Leave an earlier Shaft Analyser behind (data, program, shortcut) for the installer to migrate
+        shell: bash
+        run: |
+          H="$HOME"; [ "$RUNNER_OS" = Windows ] && H="$(cygpath -u "$USERPROFILE")"
+          mkdir -p "$H/ShaftAnalyser/shafts/old-shaft" && echo '{"id":"old-shaft","name":"Old shaft"}' > "$H/ShaftAnalyser/shafts/old-shaft/shaft.json"
+          if [ "$RUNNER_OS" = Windows ]; then
+            mkdir -p "$H/Downloads/ShaftAnalyser/_internal" "$H/Downloads/ShaftAnalyser/config"
+            cp "$(command -v cmd.exe || echo /c/Windows/System32/cmd.exe)" "$H/Downloads/ShaftAnalyser/ShaftAnalyser.exe"
+            echo "x: 1" > "$H/Downloads/ShaftAnalyser/config/defaults.yaml"
+          fi
+      - name: Install with the one-line command (macOS / Linux)
+        if: runner.os != 'Windows'
+        env: { SHAFT_RELEASE_URL: "http://127.0.0.1:8011", SHAFT_NO_START: "1" }
+        run: curl -fsSL http://127.0.0.1:8011/install.sh | sh
+      - name: Install with the one-line command (Windows PowerShell)
+        if: runner.os == 'Windows'
+        shell: powershell
+        env: { SHAFT_RELEASE_URL: "http://127.0.0.1:8011", SHAFT_NO_START: "1" }
+        run: irm http://127.0.0.1:8011/install.ps1 | iex
+      - name: Locate the install
+        shell: bash
+        run: |
+          if [ "$RUNNER_OS" = Windows ]; then echo "SA=$(cygpath -u "$USERPROFILE")/ShaftAnalyser/shaft-analyser.exe" >> "$GITHUB_ENV"
+          else echo "SA=$HOME/ShaftAnalyser/shaft-analyser" >> "$GITHUB_ENV"; test -L "$HOME/.local/bin/shaft-analyser"; fi
+      - name: The earlier install was migrated
+        shell: bash
+        run: |
+          H="$HOME"; [ "$RUNNER_OS" = Windows ] && H="$(cygpath -u "$USERPROFILE")"
+          test -f "$H/ShaftAnalyser/workspace/shafts/old-shaft/shaft.json"
+          test ! -e "$H/ShaftAnalyser/shafts"
+          if [ "$RUNNER_OS" = Windows ]; then test ! -e "$H/Downloads/ShaftAnalyser"; test -f "$H/ShaftAnalyser/workspace/old_config/0/defaults.yaml"; fi
+          curl -sf http://127.0.0.1:8765/api/shafts > /dev/null || true
+      - name: Version
+        shell: bash
+        run: '"$SA" version | grep -F "${{ needs.build.outputs.version }}"'
+      - name: Self-check (whole pipeline on the synthetic shaft, against its ground truth)
+        shell: bash
+        run: '"$SA" check'
+      - name: Doctor
+        shell: bash
+        run: '"$SA" doctor'
+      - name: The app serves its page
+        shell: bash
+        run: |
+          "$SA" start --no-browser > serve.log 2>&1 &
+          for i in $(seq 120); do curl -sf http://127.0.0.1:8765/api/health && break; sleep 2; done
+          curl -sf http://127.0.0.1:8765/ | grep -q "Shaft Analyser"
+          curl -sf http://127.0.0.1:8765/api/version | grep -q "${{ needs.build.outputs.version }}"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: score-${{ matrix.plat }}
+          path: ~/ShaftAnalyser/workspace/self_check/score.json
+
+  publish:
+    needs: [decide, build, verify]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { repository: "${{ env.SOURCE_REPO }}", ref: "${{ needs.decide.outputs.sha }}", token: "${{ secrets.SOURCE_TOKEN }}" }
+      - uses: actions/download-artifact@v4
+        with: { name: release, path: dist }
+      - uses: actions/download-artifact@v4
+        with: { pattern: score-*, path: scores }
+      - name: Release notes
+        run: |
+          V=${{ needs.build.outputs.version }}
+          {
+            echo "Shaft Analyser $V — passed every check before release."
+            echo
+            echo "| Platform | Self-check on the synthetic shaft | Four classes wrong |"
+            echo "|---|---|---|"
+            for d in scores/score-*; do
+              p=${d#scores/score-}
+              python3 - "$d/score.json" "$p" <<'EOF'
+          import json, sys
+          s = json.load(open(sys.argv[1]))
+          checks = [v for v in s.values() if isinstance(v, dict) and "pass" in v]
+          ok = sum(1 for c in checks if c["pass"])
+          w = next((v.get("wrong_pct") for k, v in s.items() if "four classes" in k), None)
+          print(f"| {sys.argv[2]} | {ok}/{len(checks)} criteria passed | {w} % |")
+          EOF
+            done
+            echo
+            echo "Install or upgrade with one command:"
+            echo
+            echo '- macOS / Linux: `curl -fsSL https://github.com/Saif0089/shaft-analyser-releases/releases/latest/download/install.sh | sh`'
+            echo '- Windows PowerShell: `irm https://github.com/Saif0089/shaft-analyser-releases/releases/latest/download/install.ps1 | iex`'
+            echo '- Windows cmd: `powershell -NoProfile -c "irm https://github.com/Saif0089/shaft-analyser-releases/releases/latest/download/install.ps1 | iex"`'
+            echo
+            echo "Installed copies update themselves to this version (verified against checksums.txt)."
+            echo
+            echo "Commit: ${{ needs.decide.outputs.sha }}"
+          } > notes.md
+          cat notes.md
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          V=${{ needs.build.outputs.version }}
+          gh release create "$V" --repo "$RELEASES_REPO" --title "Shaft Analyser $V" --notes-file notes.md dist/*
+      - name: Tag the source
+        run: |
+          git tag "${{ needs.build.outputs.version }}" && git push origin "${{ needs.build.outputs.version }}" || echo "tag not pushed"
+
+  update-e2e:
+    # A copy of the previous release, started as a user would, must update itself to the one just published.
+    needs: [build, publish]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: windows-latest, plat: windows-x64, exe: shaft-analyser.exe }
+          - { os: ubuntu-latest, plat: linux-x64, exe: shaft-analyser }
+          - { os: macos-14, plat: macos-arm64, exe: shaft-analyser }
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
+    env:
+      SHAFT_UPDATE_CHECK_S: "10"
+      SHAFT_NOTIFY: "0"
+    steps:
+      - name: Previous release
+        id: prev
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          prev=$(gh release list --repo "$RELEASES_REPO" --limit 5 --json tagName -q '.[].tagName' | { grep -v "^${{ needs.build.outputs.version }}$" || true; } | head -1)
+          echo "tag=$prev" >> "$GITHUB_OUTPUT"
+          echo "previous release: ${prev:-none}"
+      - name: Install the previous release and let it update itself
+        if: steps.prev.outputs.tag != ''
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          P=${{ steps.prev.outputs.tag }}; N=${{ needs.build.outputs.version }}
+          mkdir -p "$RUNNER_TEMP/old" && cd "$RUNNER_TEMP/old"
+          gh release download "$P" --repo "$RELEASES_REPO" --pattern "ShaftAnalyser-$P-${{ matrix.plat }}.zip"
+          unzip -q "ShaftAnalyser-$P-${{ matrix.plat }}.zip"
+          chmod +x ShaftAnalyser/shaft-analyser 2>/dev/null || true
+          ./ShaftAnalyser/${{ matrix.exe }} start --no-browser > run.log 2>&1 &
+          for i in $(seq 360); do
+            v=$(curl -s http://127.0.0.1:8765/api/version || true)
+            case "$v" in *"\"version\":\"$N\""*'"state":"updated"'*) echo "updated $P -> $N after $((i*5)) s"; exit 0;; esac
+            sleep 5
+          done
+          echo "did not update"; cat run.log; exit 1
+
+  report-failure:
+    needs: [decide, test, build, verify, publish, update-e2e]
+    if: failure()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Open an issue
+        env:
+          GH_TOKEN: ${{ secrets.SOURCE_TOKEN }}
+        run: |
+          gh issue create --repo "$SOURCE_REPO" \
+            --title "Release blocked: ${{ github.workflow }} #${{ github.run_number }} failed" \
+            --body "No release was published (or the update test failed after publishing). Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }} — commit ${{ needs.decide.outputs.sha }}"
