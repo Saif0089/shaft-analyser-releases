@@ -1,0 +1,20 @@
+name: windows-check
+# Manual: run backend tests on a Windows runner at a given ref of the source repository (exports, file handling),
+# because the release's Windows verify only installs, self-checks and serves the app.
+on:
+  workflow_dispatch:
+    inputs:
+      ref: { description: "source ref", default: "main" }
+      tests: { description: "pytest arguments", default: "tests/test_exports.py -v -x" }
+env:
+  SOURCE_REPO: Saif0089/delta_scan_shaft_analyser
+jobs:
+  check:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { repository: "${{ env.SOURCE_REPO }}", ref: "${{ inputs.ref }}", token: "${{ secrets.SOURCE_TOKEN }}" }
+      - uses: astral-sh/setup-uv@v6
+      - name: Backend tests on Windows
+        working-directory: backend
+        run: uv sync --python 3.12 --frozen; uv run pytest ${{ inputs.tests }}
