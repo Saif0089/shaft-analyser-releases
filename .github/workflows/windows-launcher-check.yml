@@ -1,0 +1,19 @@
+name: windows-launcher-check
+# Manual: the launcher's Go tests on a Windows runner at a given ref of the source repository (updates, file locks).
+on:
+  workflow_dispatch:
+    inputs:
+      ref: { description: "source ref", default: "main" }
+env:
+  SOURCE_REPO: Saif0089/delta_scan_shaft_analyser
+jobs:
+  check:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { repository: "${{ env.SOURCE_REPO }}", ref: "${{ inputs.ref }}", token: "${{ secrets.SOURCE_TOKEN }}" }
+      - uses: actions/setup-go@v5
+        with: { go-version: "1.24" }
+      - name: Launcher tests on Windows
+        working-directory: launcher
+        run: go test -v ./...
