@@ -137,6 +137,11 @@ jobs:
                 Write-Host ("{0} pid {1,6} ppid {2,6} {3,-18} started {4:HH:mm:ss}  {5}" -f $mark, $p.ProcessId, $p.ParentProcessId, $p.Name, $p.CreationDate, $p.CommandLine)
               }
               $script:procPids = @($procs | ForEach-Object { [int]$_.ProcessId })
+              Write-Host "--- browser and shell processes (msedge, chrome, firefox, OpenWith, explorer)"
+              foreach ($p in @(Get-CimInstance Win32_Process | Where-Object { $_.Name -match '^(msedge|chrome|firefox|OpenWith|explorer)\.exe$' })) {
+                $c = "$($p.CommandLine)"; if ($c.Length -gt 160) { $c = $c.Substring(0, 160) + ' ...' }
+                Write-Host ("  pid {0,6} ppid {1,6} {2,-14} started {3:HH:mm:ss}  {4}" -f $p.ProcessId, $p.ParentProcessId, $p.Name, $p.CreationDate, $c)
+              }
               Write-Host "===== end of dump ($label) ====="
             } catch { Write-Host "dump failed: $_" } finally { $ErrorActionPreference = $eap }
           }
@@ -295,6 +300,7 @@ jobs:
             }
             Pump
             Log "app up: /api/version = $(Api '/version' | ConvertTo-Json -Compress)"
+            if ($env:BROWSER -eq 'true') { Start-Sleep 20; Pump; Log 'waited 20 s for the browser the app opens (1.5 s after it starts)' }
 
             # 4. the job, then the holder
             if ($env:JOB -eq 'export') {
