@@ -105,6 +105,13 @@ jobs:
               }
             }
           }
+          $failRx = 'Installing the downloaded update failed|could not be installed \('   # v0.3.8 launcher | later ones
+          function InUse {   # the app folder in use: the one app.current names (launchers from v0.3.9), else app
+            $name = (ReadShared (Join-Path $root 'app.current')).Trim()
+            if ($name -and $name -notmatch '[\\/]') { return $name }
+            return 'app'
+          }
+          function Status { try { return (ReadShared (Join-Path $root 'updates\status.json')) | ConvertFrom-Json } catch { return $null } }
           function Api([string]$path) { try { return Invoke-RestMethod -TimeoutSec 10 "$api$path" } catch { return $null } }
           function Healthy { $h = Api '/health'; return ($null -ne $h -and $h.ok -eq $true) }
           function Post([string]$path, $body) {
@@ -336,9 +343,16 @@ jobs:
             $end = (Get-Date).AddMinutes(8)
             while ((Get-Date) -lt $end) {
               Pump
-              if ((ReadShared $out) -match 'Installing the downloaded update failed') { $outcome = 'failed'; break }
-              $v = Api '/version'
-              if ($null -ne $v -and $v.version -eq $fake -and (Healthy)) { $outcome = 'installed'; break }
+              $con = ReadShared $out
+              if ($con -match $failRx) { $outcome = 'failed'; break }
+              if ($con -match "Installed $([regex]::Escape($fake))\.") {   # the launcher has switched (app.current is written by then)
+                $name = InUse
+                $ver = if ($name -ne 'app') { (ReadShared (Join-Path $root "$name\VERSION")).Trim() } else { (Api '/version').version }
+                $st = Status
+                if ($ver -eq $fake -and $null -ne $st -and $st.state -in 'updated', 'current' -and $st.current -eq $fake -and (Healthy)) {
+                  $outcome = 'installed'; break
+                }
+              }
               if ($L.HasExited) { Log "the launcher exited ($($L.ExitCode))"; break }
               Start-Sleep 2
             }
@@ -351,14 +365,16 @@ jobs:
               Log 'watching 90 s more (does the launcher try again, and does it ever succeed?)'
               $end2 = (Get-Date).AddSeconds(90)
               while ((Get-Date) -lt $end2) { Pump; Start-Sleep 3 }
-              $n = ([regex]::Matches((ReadShared $out), 'Installing the downloaded update failed')).Count
+              $n = ([regex]::Matches((ReadShared $out), $failRx)).Count
               $v = Api '/version'
               Log "failed installs so far: $n; /api/version now: $($v | ConvertTo-Json -Compress)"
               Dump 'end of the observation'
             }
             if ($outcome -eq 'installed') {
-              $v = Api '/version'
-              Log "/api/version: $($v | ConvertTo-Json -Compress); health: $(Healthy)"
+              $name = InUse
+              Log "installed: app folder in use '$name' (app.current: '$((ReadShared (Join-Path $root 'app.current')).Trim())'), its VERSION $((ReadShared (Join-Path $root "$name\VERSION")).Trim())"
+              Log "status.json: $(Status | ConvertTo-Json -Compress); health: $(Healthy)"
+              Log "/api/version: $(Api '/version' | ConvertTo-Json -Compress)  (the v0.3.8 app code reads <root>\app\VERSION)"
             }
           } catch {
             Log "HARNESS ERROR: $_"
@@ -376,12 +392,12 @@ jobs:
           Write-Host (ReadShared (Join-Path $root 'updates\status.json'))
           Write-Host "===== $root\updates ====="
           if (Test-Path (Join-Path $root 'updates')) { Get-ChildItem -Recurse -Depth 1 (Join-Path $root 'updates') | ForEach-Object { Write-Host "  $($_.FullName)" } }
-          Write-Host "===== app\VERSION ====="
-          Write-Host (ReadShared (Join-Path $app 'VERSION'))
+          Write-Host "===== app folders (app.current: '$((ReadShared (Join-Path $root 'app.current')).Trim())', updates\previous.txt: '$((ReadShared (Join-Path $root 'updates\previous.txt')).Trim())') ====="
+          Get-ChildItem -Directory $root -Filter 'app*' | ForEach-Object { Write-Host "  $($_.Name)\VERSION = $((ReadShared (Join-Path $_.FullName 'VERSION')).Trim())" }
           Write-Host "===== fake release server requests ====="
           Write-Host (ReadShared (Join-Path $logs 'server.log'))
           Write-Host (ReadShared (Join-Path $logs 'server.err'))
-          if ($outcome -in 'timeout', 'harness-error') { Dump 'final' }
+          Dump "final ($outcome)"
 
           Log "RESULT: outcome=$outcome expect=$env:EXPECT"
           foreach ($p in $L, $holderProc, $srv) { if ($p -and -not $p.HasExited) { taskkill /T /F /PID $p.Id 2>&1 | Out-Null } }
