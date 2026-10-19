@@ -1,0 +1,389 @@
+name: windows-update-e2e
+# Manual only. An installed Windows copy (the full zip of `base`) updates itself to a fake release v9.9.9 served on
+# 127.0.0.1:9999 (base's app zip with app/VERSION rewritten), while something may hold <root>\app:
+#   holder=tools    the folder's own Python sleeping with its working directory in app\backend (an orphaned worker)
+#   holder=foreign  cmd.exe + ping with its working directory in app\backend
+#   job=export      first a real pipeline on the bundled sample and the families + segmented LAZ exports, via the API
+# /latest answers 404 until the job and holder are in place. Who holds app (Sysinternals handle + the processes) is
+# dumped right before the update is allowed and on a failed install. Publishes nothing, touches no release.
+on:
+  workflow_dispatch:
+    inputs:
+      launcher:
+        description: "Launcher under test: release:vX.Y.Z (that release's Windows launcher) or a source ref (built from launcher/)"
+        default: "release:v0.3.8"
+      holder:
+        description: "What holds <root>\\app\\backend as its working directory during the update"
+        type: choice
+        options: [none, tools, foreign]
+        default: none
+      job:
+        description: "Before the update: none, or export (pipeline on the sample + families and segmented exports)"
+        type: choice
+        options: [none, export]
+        default: none
+      expect:
+        description: "The run passes only on this outcome"
+        type: choice
+        options: [installed, failed]
+        default: installed
+      base:
+        description: "Release whose full Windows zip is the install and whose app zip becomes v9.9.9"
+        default: "v0.3.8"
+      browser:
+        description: "Start as a double-click does (the app opens the browser itself) instead of start --no-browser"
+        type: boolean
+        default: false
+
+run-name: "update-e2e ${{ inputs.launcher }} holder=${{ inputs.holder }} job=${{ inputs.job }} expect=${{ inputs.expect }}${{ inputs.browser && ' browser' || '' }}"
+
+permissions:
+  contents: read
+
+env:
+  SOURCE_REPO: Saif0089/delta_scan_shaft_analyser
+  RELEASES_REPO: ${{ github.repository }}
+
+jobs:
+  e2e:
+    runs-on: windows-latest
+    timeout-minutes: 80
+    steps:
+      - name: Source of the launcher under test (a ref)
+        if: ${{ !startsWith(inputs.launcher, 'release:') }}
+        uses: actions/checkout@v4
+        with: { repository: "${{ env.SOURCE_REPO }}", ref: "${{ inputs.launcher }}", token: "${{ secrets.SOURCE_TOKEN }}", path: src }
+      - uses: actions/setup-go@v5
+        if: ${{ !startsWith(inputs.launcher, 'release:') }}
+        with: { go-version: "1.24", cache: false }
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - name: Install, update, observe
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          LAUNCHER: ${{ inputs.launcher }}
+          HOLDER: ${{ inputs.holder }}
+          JOB: ${{ inputs.job }}
+          EXPECT: ${{ inputs.expect }}
+          BASE: ${{ inputs.base }}
+          BROWSER: ${{ inputs.browser }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $ProgressPreference = 'SilentlyContinue'
+          $T = $env:RUNNER_TEMP
+          $scripts = Join-Path $T 'e2e-scripts'; $dl = Join-Path $T 'e2e-dl'; $rel = Join-Path $T 'e2e-release'
+          $logs = Join-Path $T 'e2e-logs'; $tools = Join-Path $T 'e2e-tools'
+          New-Item -ItemType Directory -Force $scripts, $dl, $rel, $logs, $tools | Out-Null
+          $root = Join-Path $env:USERPROFILE 'ShaftAnalyser'
+          $app = Join-Path $root 'app'
+          $flag = Join-Path $T 'e2e-allow-update'
+          $fake = 'v9.9.9'
+          $api = 'http://127.0.0.1:8765/api'
+          $out = Join-Path $logs 'launcher.out'; $err = Join-Path $logs 'launcher.err'
+          $handleExe = Join-Path $tools 'handle64.exe'
+          $script:seen = @{}
+          $script:holderPids = @(); $script:procPids = @()
+
+          function Log([string]$m) { Write-Host ("[{0:HH:mm:ss}] {1}" -f (Get-Date), $m) }
+          function ReadShared([string]$p) {
+            try {
+              $fs = [System.IO.File]::Open($p, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]'ReadWrite, Delete')
+              try { return (New-Object System.IO.StreamReader($fs)).ReadToEnd() } finally { $fs.Dispose() }
+            } catch { return '' }
+          }
+          function Pump {   # new lines of the launcher's console (its stdout and stderr files), as they come
+            foreach ($p in $out, $err) {
+              $txt = ReadShared $p
+              $n = [int]$script:seen[$p]
+              if ($txt.Length -gt $n) {
+                $new = $txt.Substring($n); $cut = $new.LastIndexOf("`n")
+                if ($cut -ge 0) {
+                  $script:seen[$p] = $n + $cut + 1
+                  foreach ($l in $new.Substring(0, $cut).Split("`n")) { Write-Host ("[{0:HH:mm:ss}]   console| {1}" -f (Get-Date), $l.TrimEnd("`r")) }
+                }
+              }
+            }
+          }
+          function Api([string]$path) { try { return Invoke-RestMethod -TimeoutSec 10 "$api$path" } catch { return $null } }
+          function Healthy { $h = Api '/health'; return ($null -ne $h -and $h.ok -eq $true) }
+          function Post([string]$path, $body) {
+            if ($null -eq $body) { return Invoke-RestMethod -Method Post -TimeoutSec 120 "$api$path" }
+            return Invoke-RestMethod -Method Post -TimeoutSec 120 "$api$path" -ContentType 'application/json' -Body (ConvertTo-Json $body -Compress)
+          }
+          function Dump([string]$label) {   # never opens anything under app: handle64 lists handles, CIM lists processes
+            $eap = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
+            try {
+              Write-Host ""
+              Write-Host "===== who holds $app : $label ($(Get-Date -Format HH:mm:ss)) ====="
+              $script:holderPids = @()
+              if (Test-Path $handleExe) {
+                $h = (& $handleExe -accepteula -nobanner $app 2>&1 | Out-String).TrimEnd()
+                Write-Host "--- handle64.exe -accepteula -nobanner $app"
+                Write-Host $(if ($h) { $h } else { '(no output)' })
+                $script:holderPids = @([regex]::Matches($h, 'pid:\s*(\d+)') | ForEach-Object { [int]$_.Groups[1].Value } | Sort-Object -Unique)
+              } else { Write-Host '--- handle64.exe not available' }
+              $procs = @(Get-CimInstance Win32_Process | Where-Object { $_.ExecutablePath -like "$root*" -or $_.CommandLine -like "*$root*" -or $script:holderPids -contains [int]$_.ProcessId })
+              Write-Host "--- processes with their executable or command line under $root, or a handle under app (* = holds app)"
+              foreach ($p in $procs) {
+                $mark = if ($script:holderPids -contains [int]$p.ProcessId) { '*' } else { ' ' }
+                Write-Host ("{0} pid {1,6} ppid {2,6} {3,-18} started {4:HH:mm:ss}  {5}" -f $mark, $p.ProcessId, $p.ParentProcessId, $p.Name, $p.CreationDate, $p.CommandLine)
+              }
+              $script:procPids = @($procs | ForEach-Object { [int]$_.ProcessId })
+              Write-Host "===== end of dump ($label) ====="
+            } catch { Write-Host "dump failed: $_" } finally { $ErrorActionPreference = $eap }
+          }
+          function WaitStage([string]$scid, [string]$stage, [int]$minutes = 40) {
+            $end = (Get-Date).AddMinutes($minutes); $last = [datetime]::MinValue
+            while ($true) {
+              Pump
+              $s = Api "/scans/$scid"
+              if ($null -ne $s) {
+                foreach ($k in $s.stages.PSObject.Properties.Name) {
+                  if ($s.stages.$k.status -eq 'failed') { throw "stage $k failed: $($s.stages.$k.error)" }
+                }
+                $st = $s.stages.$stage
+                if ($st.status -eq 'done') { Log "  $stage done in $($st.seconds) s"; return }
+                if (((Get-Date) - $last).TotalSeconds -ge 30) {
+                  $last = Get-Date; Log ("  {0}: {1} {2:n0} % {3}" -f $stage, $st.status, (100 * [double]$st.progress), $st.message)
+                }
+              }
+              if ((Get-Date) -gt $end) { throw "$stage not done after $minutes min" }
+              Start-Sleep 3
+            }
+          }
+
+          $outcome = 'harness-error'
+          $L = $null; $holderProc = $null; $srv = $null
+          try {
+            Log "launcher=$env:LAUNCHER holder=$env:HOLDER job=$env:JOB expect=$env:EXPECT base=$env:BASE browser=$env:BROWSER"
+            Log "$((Get-CimInstance Win32_OperatingSystem).Caption) $([Environment]::OSVersion.Version), pwsh $($PSVersionTable.PSVersion), $([Environment]::ProcessorCount) logical CPUs"
+            try { Log "Defender real-time protection: $((Get-MpComputerStatus).RealTimeProtectionEnabled)" } catch { Log 'Defender status: not available' }
+
+            # Sysinternals handle
+            foreach ($i in 1..3) {
+              try { Invoke-WebRequest -UseBasicParsing 'https://live.sysinternals.com/handle64.exe' -OutFile $handleExe; break }
+              catch { Log "handle64 download attempt $i failed: $($_.Exception.Message)"; Start-Sleep 5 }
+            }
+            if (-not (Test-Path $handleExe)) {
+              try { Invoke-WebRequest -UseBasicParsing 'https://download.sysinternals.com/files/Handle.zip' -OutFile (Join-Path $tools 'Handle.zip'); Expand-Archive -Force (Join-Path $tools 'Handle.zip') $tools }
+              catch { Log "Handle.zip download failed: $($_.Exception.Message)" }
+            }
+            Log "handle64.exe: $(if (Test-Path $handleExe) { (Get-Item $handleExe).VersionInfo.FileVersion } else { 'MISSING' })"
+
+            # 1. the client's install: the full Windows zip of the base release, unzipped as is
+            $zipName = "ShaftAnalyser-$env:BASE-windows-x64.zip"
+            gh release download $env:BASE --repo $env:RELEASES_REPO --dir $dl --pattern $zipName --pattern 'shaft-analyser-app.zip' --pattern 'checksums.txt'
+            if ($LASTEXITCODE) { throw "downloading release $env:BASE failed" }
+            $sums = @{}
+            foreach ($l in Get-Content (Join-Path $dl 'checksums.txt')) { $f = -split $l; if ($f.Count -eq 2) { $sums[$f[1]] = $f[0] } }
+            foreach ($n in $zipName, 'shaft-analyser-app.zip') {
+              $h = (Get-FileHash (Join-Path $dl $n) -Algorithm SHA256).Hash.ToLower()
+              if ($h -ne $sums[$n]) { throw "$n does not match the release's checksums.txt" }
+            }
+            Log "downloaded $zipName and shaft-analyser-app.zip (both match the release's checksums.txt)"
+            tar -xf (Join-Path $dl $zipName) -C $env:USERPROFILE
+            if ($LASTEXITCODE) { throw 'unzipping the install failed' }
+            Log "install root $root :"
+            Get-ChildItem -Force $root | ForEach-Object { Write-Host ("      {0,-6} {1,12} {2}" -f $_.Mode, $(if ($_.PSIsContainer) { '<dir>' } else { $_.Length }), $_.Name) }
+            Get-ChildItem -Force $app | ForEach-Object { Write-Host ("      app\{0}" -f $_.Name) }
+            Get-ChildItem -Force (Join-Path $root 'sample_input') | ForEach-Object { Write-Host ("      sample_input\{0} {1}" -f $_.Name, $_.Length) }
+            Log "app\VERSION = $((Get-Content (Join-Path $app 'VERSION')).Trim())"
+
+            # the launcher under test at <root>\shaft-analyser.exe
+            $exe = Join-Path $root 'shaft-analyser.exe'
+            if ($env:LAUNCHER -like 'release:*') {
+              $tag = $env:LAUNCHER.Substring(8)
+              $d = Join-Path $dl "launcher-$tag"; New-Item -ItemType Directory -Force $d | Out-Null
+              gh release download $tag --repo $env:RELEASES_REPO --dir $d --pattern 'shaft-analyser-windows-amd64.exe'
+              if ($LASTEXITCODE) { throw "downloading the launcher of $tag failed" }
+              Copy-Item -Force (Join-Path $d 'shaft-analyser-windows-amd64.exe') $exe
+              Log "launcher: release $tag's shaft-analyser-windows-amd64.exe"
+            } else {
+              $srcDir = Join-Path $env:GITHUB_WORKSPACE 'src'
+              Push-Location (Join-Path $srcDir 'launcher')
+              go build -ldflags "-X main.Version=test" -o $exe .
+              $rc = $LASTEXITCODE; Pop-Location
+              if ($rc) { throw 'go build of the launcher failed' }
+              Log "launcher: built from $env:SOURCE_REPO@$env:LAUNCHER, commit $(git -C $srcDir rev-parse HEAD)"
+              git -C $srcDir log -3 --format='      %h %s'
+            }
+            Log "$(& $exe version)  sha256 $((Get-FileHash $exe -Algorithm SHA256).Hash.ToLower())"
+
+            # 2. the fake release v9.9.9: base's app zip with app/VERSION rewritten, its checksum, no launcher binary
+            @(
+              'import sys, zipfile'
+              'src, dst, ver = sys.argv[1:4]'
+              'with zipfile.ZipFile(src) as zi, zipfile.ZipFile(dst, "w") as zo:'
+              '    for i in zi.infolist():'
+              '        data = zi.read(i.filename)'
+              '        if i.filename == "app/VERSION":'
+              '            data = (ver + "\n").encode()'
+              '        zo.writestr(i, data)'
+              'print(dst, "app/VERSION =", zipfile.ZipFile(dst).read("app/VERSION"))'
+            ) | Set-Content -Encoding utf8 (Join-Path $scripts 'mkzip.py')
+            python -I (Join-Path $scripts 'mkzip.py') (Join-Path $dl 'shaft-analyser-app.zip') (Join-Path $rel 'shaft-analyser-app.zip') $fake
+            if ($LASTEXITCODE) { throw 'making the fake app zip failed' }
+            $h = (Get-FileHash (Join-Path $rel 'shaft-analyser-app.zip') -Algorithm SHA256).Hash.ToLower()
+            [System.IO.File]::WriteAllText((Join-Path $rel 'checksums.txt'), "$h  shaft-analyser-app.zip`n")
+            Log "fake release ${fake}: checksums.txt = $h  shaft-analyser-app.zip"
+            @(
+              'import http.server, os, sys, time'
+              'REL, FLAG, LOG, TAG = sys.argv[1:5]'
+              'class H(http.server.BaseHTTPRequestHandler):'
+              '    def log_message(self, fmt, *args):'
+              '        with open(LOG, "a") as f:'
+              '            f.write(time.strftime("%H:%M:%S ") + (fmt % args) + "\n")'
+              '    def _empty(self, code, loc=None):'
+              '        self.send_response(code)'
+              '        if loc:'
+              '            self.send_header("Location", loc)'
+              '        self.send_header("Content-Length", "0")'
+              '        self.end_headers()'
+              '    def _route(self, body):'
+              '        if self.path == "/latest":'
+              '            if os.path.exists(FLAG):'
+              '                return self._empty(302, "http://127.0.0.1:9999/tag/" + TAG)'
+              '            return self._empty(404)'
+              '        pre = "/download/" + TAG + "/"'
+              '        p = os.path.join(REL, os.path.basename(self.path[len(pre):])) if self.path.startswith(pre) else ""'
+              '        if not p or not os.path.isfile(p):'
+              '            return self._empty(404)'
+              '        with open(p, "rb") as f:'
+              '            b = f.read()'
+              '        self.send_response(200)'
+              '        self.send_header("Content-Type", "application/octet-stream")'
+              '        self.send_header("Content-Length", str(len(b)))'
+              '        self.end_headers()'
+              '        if body:'
+              '            self.wfile.write(b)'
+              '    def do_HEAD(self):'
+              '        self._route(False)'
+              '    def do_GET(self):'
+              '        self._route(True)'
+              'http.server.ThreadingHTTPServer(("127.0.0.1", 9999), H).serve_forever()'
+            ) | Set-Content -Encoding utf8 (Join-Path $scripts 'server.py')
+            $py = (Get-Command python).Source
+            $srv = Start-Process -FilePath $py -ArgumentList '-I', (Join-Path $scripts 'server.py'), $rel, $flag, (Join-Path $logs 'server.log'), $fake `
+              -RedirectStandardOutput (Join-Path $logs 'server.out') -RedirectStandardError (Join-Path $logs 'server.err') -PassThru
+            $code = ''
+            foreach ($i in 1..30) { $code = curl.exe -s -o NUL -w '%{http_code}' -I http://127.0.0.1:9999/latest; if ($code -eq '404') { break }; Start-Sleep 1 }
+            if ($code -ne '404') { throw "the fake release server did not come up ($code)" }
+            Log "fake release server on 127.0.0.1:9999 (pid $($srv.Id)); /latest answers 404 until the update is allowed"
+
+            # 3. the launcher, as the client starts it
+            $env:SHAFT_UPDATE_BASE = 'http://127.0.0.1:9999'
+            $env:SHAFT_UPDATE_CHECK_S = '20'
+            $env:SHAFT_NOTIFY = '0'
+            $largs = if ($env:BROWSER -eq 'true') { @('start') } else { @('start', '--no-browser') }
+            $L = Start-Process -FilePath $exe -ArgumentList $largs -WorkingDirectory $root -RedirectStandardOutput $out -RedirectStandardError $err -PassThru
+            $null = $L.Handle
+            Log "started: $exe $($largs -join ' ') (pid $($L.Id)), cwd $root"
+            $deadline = (Get-Date).AddMinutes(15)
+            while (-not (Healthy)) {
+              Pump
+              if ($L.HasExited) { throw "the launcher exited ($($L.ExitCode)) before the app came up" }
+              if ((Get-Date) -gt $deadline) { throw 'the app did not come up within 15 minutes' }
+              Start-Sleep 3
+            }
+            Pump
+            Log "app up: /api/version = $(Api '/version' | ConvertTo-Json -Compress)"
+
+            # 4. the job, then the holder
+            if ($env:JOB -eq 'export') {
+              $src = Join-Path $root 'sample_input\synthetic_shaft.laz'
+              Log "job: new shaft, add scan $src, pipeline, confirm layout, segmentation, exports (families, segmented) - via the API"
+              $shaft = Post '/shafts' @{ name = 'E2E shaft'; mine = 'CI'; notes = '' }
+              $scan = Post "/shafts/$($shaft.id)/scans" @{ path = $src }
+              $scid = $scan.id
+              Log "  shaft $($shaft.id), scan $scid"
+              foreach ($st in 'ingest', 'audit', 'layout', 'qc') { WaitStage $scid $st }
+              $qc = Api "/scans/$scid/qc"
+              Log "  correction check: $($qc.status)"
+              if ($qc.status -eq 'RED') { $null = Post "/scans/$scid/decision" @{ choice = 'proceed'; note = 'CI' }; Log '  decision: proceed' }
+              $null = Post "/scans/$scid/layout/confirm" $null
+              WaitStage $scid 'segment'
+              $null = Post "/scans/$scid/exports/families" $null
+              WaitStage $scid 'export_families'
+              $null = Post "/scans/$scid/exports/simple" $null
+              WaitStage $scid 'export_simple'
+              $ex = Api "/scans/$scid/exports"
+              foreach ($f in $ex.files) { Log ("  export file {0}  {1:n0} bytes" -f $f.name, $f.size) }
+              curl.exe -sf -o (Join-Path $dl 'segmented.laz') "$api/scans/$scid/exports/file/segmented.laz"
+              if ($LASTEXITCODE) { throw 'downloading segmented.laz from the app failed' }
+              Log "  downloaded segmented.laz through the app: $((Get-Item (Join-Path $dl 'segmented.laz')).Length) bytes"
+              $busy = @(Api '/jobs' | Where-Object { $_.status -in 'queued', 'running' })
+              Log "  jobs queued or running now: $($busy.Count)"
+              Pump
+            }
+            $backend = Join-Path $app 'backend'
+            if ($env:HOLDER -eq 'tools') {
+              $holderProc = Start-Process -FilePath (Join-Path $root '.tools\venv\Scripts\python.exe') -ArgumentList '-c "import time; time.sleep(1500)"' `
+                -WorkingDirectory $backend -PassThru -WindowStyle Hidden
+            } elseif ($env:HOLDER -eq 'foreign') {
+              $holderProc = Start-Process -FilePath "$env:SystemRoot\System32\cmd.exe" -ArgumentList '/c ping -n 1500 127.0.0.1 >nul' `
+                -WorkingDirectory $backend -PassThru -WindowStyle Hidden
+            }
+            if ($holderProc) { Start-Sleep 3; Log "holder '$env:HOLDER' started: pid $($holderProc.Id), cwd $backend, alive: $(-not $holderProc.HasExited)" }
+
+            Dump 'right before the update is allowed'
+            $before = $script:procPids
+            New-Item -ItemType File -Force $flag | Out-Null
+            Log "update allowed: /latest now redirects to /tag/$fake"
+
+            # 5. the outcome (read over HTTP and from the console log: nothing here opens a file under app)
+            $outcome = 'timeout'
+            $end = (Get-Date).AddMinutes(8)
+            while ((Get-Date) -lt $end) {
+              Pump
+              if ((ReadShared $out) -match 'Installing the downloaded update failed') { $outcome = 'failed'; break }
+              $v = Api '/version'
+              if ($null -ne $v -and $v.version -eq $fake -and (Healthy)) { $outcome = 'installed'; break }
+              if ($L.HasExited) { Log "the launcher exited ($($L.ExitCode))"; break }
+              Start-Sleep 2
+            }
+            Pump
+            Log "OUTCOME: $outcome"
+            if ($outcome -eq 'failed') {
+              Dump 'right after the failed install'
+              $left = @($script:holderPids | Where-Object { $before -contains $_ })
+              Log "processes holding app that were already running before the update was allowed: $(if ($left) { $left -join ', ' } else { 'none' })"
+              Log 'watching 90 s more (does the launcher try again, and does it ever succeed?)'
+              $end2 = (Get-Date).AddSeconds(90)
+              while ((Get-Date) -lt $end2) { Pump; Start-Sleep 3 }
+              $n = ([regex]::Matches((ReadShared $out), 'Installing the downloaded update failed')).Count
+              $v = Api '/version'
+              Log "failed installs so far: $n; /api/version now: $($v | ConvertTo-Json -Compress)"
+              Dump 'end of the observation'
+            }
+            if ($outcome -eq 'installed') {
+              $v = Api '/version'
+              Log "/api/version: $($v | ConvertTo-Json -Compress); health: $(Healthy)"
+            }
+          } catch {
+            Log "HARNESS ERROR: $_"
+            Write-Host $_.ScriptStackTrace
+          }
+
+          # 7. the record
+          Pump
+          Write-Host ""
+          Write-Host "===== launcher console, stdout (last 80 lines) ====="
+          (ReadShared $out) -split "`n" | Select-Object -Last 80 | ForEach-Object { Write-Host $_.TrimEnd("`r") }
+          Write-Host "===== launcher console, stderr (last 60 lines) ====="
+          (ReadShared $err) -split "`n" | Select-Object -Last 60 | ForEach-Object { Write-Host $_.TrimEnd("`r") }
+          Write-Host "===== $root\updates\status.json ====="
+          Write-Host (ReadShared (Join-Path $root 'updates\status.json'))
+          Write-Host "===== $root\updates ====="
+          if (Test-Path (Join-Path $root 'updates')) { Get-ChildItem -Recurse -Depth 1 (Join-Path $root 'updates') | ForEach-Object { Write-Host "  $($_.FullName)" } }
+          Write-Host "===== app\VERSION ====="
+          Write-Host (ReadShared (Join-Path $app 'VERSION'))
+          Write-Host "===== fake release server requests ====="
+          Write-Host (ReadShared (Join-Path $logs 'server.log'))
+          Write-Host (ReadShared (Join-Path $logs 'server.err'))
+          if ($outcome -in 'timeout', 'harness-error') { Dump 'final' }
+
+          Log "RESULT: outcome=$outcome expect=$env:EXPECT"
+          foreach ($p in $L, $holderProc, $srv) { if ($p -and -not $p.HasExited) { taskkill /T /F /PID $p.Id 2>&1 | Out-Null } }
+          if ($outcome -eq $env:EXPECT) { Log 'PASS'; exit 0 }
+          Log 'FAIL'; exit 1
