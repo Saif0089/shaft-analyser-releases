@@ -79,7 +79,7 @@ self_update() {   # self-update-holders / self-update-export (Windows)
   install_prev "$H"; plant_shaft "$H"
   local gate="$T/allow-update"
   serve "$DIST" "$N" 8012 --gate "$(wp "$gate")"
-  SHAFT_UPDATE_BASE=http://127.0.0.1:8012 SHAFT_UPDATE_CHECK_S=10 launch prev "$(exe_of "$H")" start --no-browser
+  SHAFT_UPDATE_BASE=http://127.0.0.1:8012 SHAFT_UPDATE_CHECK_S=2 launch prev "$(exe_of "$H")" start --no-browser
   local port; port=$(wait_up "$H" $UP) || fail "$PREV did not come up"
   ok "$PREV serves on $port"
   local app; app=$(app_in_use "$H")
@@ -89,6 +89,11 @@ self_update() {   # self-update-holders / self-update-export (Windows)
   hold_tools "$H" "$app/backend"; hold_foreign "$app/backend"; holders_alive "$app/backend"
   touch "$gate"; say "update allowed: /latest -> $N"
   if [ "$1" = export ]; then
+    # the update must be downloaded and waiting while the export still runs, or this proves nothing
+    field_wait=$(probe watch "$(wp "$H/updates/status.json")" ready "$N" 120) || fail "$N was not downloaded within 2 min"
+    local busy; busy=$(curl -s "http://127.0.0.1:$port/api/jobs" | "$PY" -I -c "import json,sys; print(sum(j.get('status') in ('queued','running') for j in json.load(sys.stdin)))")
+    say "$N downloaded and waiting ('$field_wait'); jobs queued or running: $busy"
+    [ "$busy" -ge 1 ] || fail "the export had already ended when $N was ready: the scenario proved nothing"
     "$PY" -I "$(wp "$HERE/job.py")" "$port" "" "$(wp "$T")" finish || fail "the exports running during the update did not finish whole"
     ok "the exports finished whole while $N was waiting to install"
   fi
