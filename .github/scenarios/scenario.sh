@@ -62,16 +62,22 @@ hold_tools() {
 hold_foreign() {
   (cd "$1" && exec cmd //c "ping -n 1500 127.0.0.1 >nul") &
   HOLDERS+=($!); SA_PIDS+=($!)
-  local f; f=$(wp "$1/pyproject.toml")
-  powershell -NoProfile -Command "\$f = [IO.File]::Open('$f', 'Open', 'Read', 'Read'); Start-Sleep 1500" &
-  HOLDERS+=($!); SA_PIDS+=($!)
+  # the marker is written once the file is open: a PowerShell that could not open it stops there, and the scenario fails
+  local f m; f=$(wp "$1/pyproject.toml"); m="$T/holding-${#OPENED[@]}"
+  powershell -NoProfile -Command "\$ErrorActionPreference = 'Stop'; \$f = [IO.File]::Open('$f', 'Open', 'Read', 'Read');
+    if (\$f) { [IO.File]::WriteAllText('$(wp "$m")', 'open') }; Start-Sleep 1500" &
+  HOLDERS+=($!); SA_PIDS+=($!); OPENED+=("$m")
 }
 holders_alive() {
-  local p; sleep 2
+  local p m; sleep 2
+  for m in ${OPENED[@]+"${OPENED[@]}"}; do
+    for _ in $(seq 60); do [ -f "$m" ] && break; sleep 0.5; done
+    [ -f "$m" ] || fail "the PowerShell holder never opened its file in $1: the scenario would prove nothing"
+  done
   for p in "${HOLDERS[@]}"; do alive "$p" || fail "holder pid $p is not running: the scenario would prove nothing"; done
   ok "${#HOLDERS[@]} holders running in $1"
 }
-HOLDERS=()
+HOLDERS=(); OPENED=()
 
 # ---- the scenarios -------------------------------------------------------------------------------------------------
 self_update() {   # self-update-holders / self-update-export (Windows)
