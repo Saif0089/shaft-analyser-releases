@@ -71,7 +71,8 @@ jobs:
           n=$(GH_TOKEN=$REL_TOKEN gh release list --repo "$RELEASES_REPO" --limit 100 --json tagName -q '.[].tagName' | grep "^v$base\." | sed "s/^v$base\.//" | sort -n | tail -1)
           echo "sha=$sha" >> "$GITHUB_OUTPUT"
           echo "version=v$base.$(( ${n:-0} + 1 ))" >> "$GITHUB_OUTPUT"
-          if [ "$sha" != "$last" ] || [ "${{ inputs.force }}" = "true" ]; then echo "go=true" >> "$GITHUB_OUTPUT"; else echo "go=false" >> "$GITHUB_OUTPUT"; fi
+          # a source_ref rehearsal always runs, also on a commit already released (else every job skips and it looks green)
+          if [ "$sha" != "$last" ] || [ "${{ inputs.force }}" = "true" ] || [ -n "$SOURCE_REF" ]; then echo "go=true" >> "$GITHUB_OUTPUT"; else echo "go=false" >> "$GITHUB_OUTPUT"; fi
           echo "$ref $sha · last released $last · next v$base.$(( ${n:-0} + 1 ))"
 
   test:
@@ -478,7 +479,8 @@ jobs:
 
   report-failure:
     needs: [decide, test, build, verify, update-e2e, scenarios, publish, published]
-    if: failure() && !inputs.dry_run
+    # not for a dry run, nor for source_ref without one (refused by decide: the operator's slip, not a blocked release)
+    if: failure() && !inputs.dry_run && inputs.source_ref == ''
     runs-on: ubuntu-latest
     permissions:
       contents: read
