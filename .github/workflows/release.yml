@@ -7,7 +7,11 @@ name: release
 # previous release updating itself to this build (served on the runner the way github.com serves a release). Only when
 # every one of those passed is the release published here, where installed copies pick it up on their own; then the
 # release is checked as github.com serves it. A failure opens an issue in the source repository and publishes nothing.
-# dry_run: every check, then nothing published (no release, no tag, no issue).
+# dry_run: every check, then nothing published (no release, no tag, no issue). source_ref (only with dry_run): rehearse
+# the whole pipeline on that branch or commit of the source repository instead of main; a real release is always main.
+# The checks: unit tests (backend pytest, launcher go vet + go test) on Windows, Linux and macOS; verify and update-e2e
+# below; and the client-machine scenarios of scenarios.yml (held folders, a running app, one app per install, a broken
+# next version, odd profile paths, offline / no desktop / read-only / full disk), all side by side after the build.
 on:
   schedule:
     - cron: "*/5 * * * *"
@@ -21,8 +25,12 @@ on:
         description: "Run every check, publish nothing (no release, no tag, no issue)"
         type: boolean
         default: false
+      source_ref:
+        description: "Dry run only: source branch or commit to check instead of main (a release is always main)"
+        type: string
+        default: ""
 
-run-name: ${{ inputs.dry_run && 'release (dry run)' || 'release' }}
+run-name: ${{ inputs.dry_run && format('release (dry run{0})', inputs.source_ref != '' && format(' of {0}', inputs.source_ref) || '') || 'release' }}
 
 concurrency:
   # one release at a time; a dry run has a group of its own (it never waits for a release, nor holds one up)
@@ -49,20 +57,36 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.SOURCE_TOKEN }}
           REL_TOKEN: ${{ github.token }}
+          SOURCE_REF: ${{ inputs.source_ref }}
         run: |
-          sha=$(gh api "repos/$SOURCE_REPO/commits/main" -q .sha)
+          ref=main
+          if [ -n "$SOURCE_REF" ]; then
+            [ "$DRY_RUN" = true ] || { echo "::error::source_ref is for dry runs only: a release is always made from main"; exit 1; }
+            ref=$SOURCE_REF
+          fi
+          sha=$(gh api "repos/$SOURCE_REPO/commits/$(printf %s "$ref" | jq -sRr @uri)" -q .sha)
+          [ ${#sha} = 40 ] || { echo "::error::cannot resolve $ref in $SOURCE_REPO"; exit 1; }
           last=$(GH_TOKEN=$REL_TOKEN gh release view --repo "$RELEASES_REPO" --json body -q .body 2>/dev/null | grep -o 'Commit: [0-9a-f]\{40\}' | cut -d' ' -f2 || true)
           base=$(gh api "repos/$SOURCE_REPO/contents/VERSION?ref=$sha" -q .content | base64 -d | tr -d '[:space:]')
           n=$(GH_TOKEN=$REL_TOKEN gh release list --repo "$RELEASES_REPO" --limit 100 --json tagName -q '.[].tagName' | grep "^v$base\." | sed "s/^v$base\.//" | sort -n | tail -1)
           echo "sha=$sha" >> "$GITHUB_OUTPUT"
           echo "version=v$base.$(( ${n:-0} + 1 ))" >> "$GITHUB_OUTPUT"
           if [ "$sha" != "$last" ] || [ "${{ inputs.force }}" = "true" ]; then echo "go=true" >> "$GITHUB_OUTPUT"; else echo "go=false" >> "$GITHUB_OUTPUT"; fi
-          echo "main $sha · last released $last · next v$base.$(( ${n:-0} + 1 ))"
+          echo "$ref $sha · last released $last · next v$base.$(( ${n:-0} + 1 ))"
 
   test:
+    # on each OS the release runs on: a Windows-only failure blocks the release too
     needs: decide
     if: needs.decide.outputs.go == 'true'
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-14]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: bash
     steps:
       - uses: actions/checkout@v4
         with: { repository: "${{ env.SOURCE_REPO }}", ref: "${{ needs.decide.outputs.sha }}", token: "${{ secrets.SOURCE_TOKEN }}" }
@@ -345,9 +369,19 @@ jobs:
         shell: bash
         run: cat "$RUNNER_TEMP/release_server.log" || true
 
+  scenarios:
+    # the client-machine scenarios (scenarios.yml), side by side with verify and update-e2e
+    needs: build
+    permissions:
+      contents: read
+      actions: read
+    uses: ./.github/workflows/scenarios.yml
+    with:
+      version: ${{ needs.build.outputs.version }}
+
   publish:
     # only after every check above passed; a dry run stops before anything is published
-    needs: [decide, test, build, verify, update-e2e]
+    needs: [decide, test, build, verify, update-e2e, scenarios]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -443,7 +477,7 @@ jobs:
           for f in install.sh install.ps1; do get "$R/latest/download/$f" "latest-$f"; cmp "latest-$f" "$f"; done
 
   report-failure:
-    needs: [decide, test, build, verify, update-e2e, publish, published]
+    needs: [decide, test, build, verify, update-e2e, scenarios, publish, published]
     if: failure() && !inputs.dry_run
     runs-on: ubuntu-latest
     permissions:

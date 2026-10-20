@@ -1,0 +1,94 @@
+name: scenarios
+# What a client's machine does to an install, on Windows, macOS and Linux, before a build is published: release.yml
+# calls this after its build (every leg gates publish). Each leg runs one .github/scenarios/scenario.sh scenario (its
+# header says what each asserts) against this build, served on the runner the way github.com serves a release.
+# Manual (workflow_dispatch): the same legs against the build artifacts of an earlier release.yml run (to work on
+# the scenarios without building); publishes nothing.
+on:
+  workflow_call:
+    inputs:
+      version: { type: string, required: true }
+      artifacts_run: { type: string, default: "" }
+      only: { type: string, default: "" }
+  workflow_dispatch:
+    inputs:
+      artifacts_run: { description: "id of a release.yml run whose build artifacts are tested", required: true }
+      version: { description: "the version that run built (vX.Y.Z)", required: true }
+      only: { description: "only these scenarios (space separated; empty: all)", default: "" }
+  push:   # DEV ONLY (removed before merge): iterate on the scenarios against run 39335459198's v0.3.10 build
+    branches: [ci/scenarios]
+    paths: [".github/scenarios/**", ".github/workflows/scenarios.yml"]
+
+run-name: ${{ github.event_name == 'workflow_dispatch' && format('scenarios {0} of run {1} {2}', inputs.version, inputs.artifacts_run, inputs.only) || 'scenarios' }}
+
+permissions:
+  contents: read
+  actions: read
+
+env:
+  ART: ${{ inputs.artifacts_run || (github.event_name == 'push' && '39335459198' || '') }}
+  VER: ${{ inputs.version || (github.event_name == 'push' && 'v0.3.10' || '') }}
+
+jobs:
+  scenario:
+    name: "${{ matrix.gate }} ${{ matrix.scenario }} (${{ matrix.plat }})"
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # G1 (S1-S3): Windows installs held by leftovers, Darryl's case
+          - { gate: G1, scenario: self-update, os: windows-latest, plat: windows-x64 }
+          - { gate: G1, scenario: legacy-orphan, os: windows-latest, plat: windows-x64 }
+          - { gate: G1, scenario: legacy-foreign, os: windows-latest, plat: windows-x64 }
+          # G2 (S4): the one-liner while the previous release runs, on 8765 and on a moved port
+          - { gate: G2, scenario: running, os: windows-latest, plat: windows-x64 }
+          - { gate: G2, scenario: running, os: ubuntu-latest, plat: linux-x64 }
+          - { gate: G2, scenario: running, os: macos-14, plat: macos-arm64 }
+          # G3 (S5/S6): one app per install, 8765 held by another program
+          - { gate: G3, scenario: single-instance, os: windows-latest, plat: windows-x64 }
+          - { gate: G3, scenario: single-instance, os: ubuntu-latest, plat: linux-x64 }
+          - { gate: G3, scenario: single-instance, os: macos-14, plat: macos-arm64 }
+          # G4 (S9/S10): a broken next version rolls back; bad downloads change nothing
+          - { gate: G4, scenario: rollback, os: windows-latest, plat: windows-x64 }
+          - { gate: G4, scenario: rollback, os: ubuntu-latest, plat: linux-x64 }
+          # G5 (S7/S8/S14): profile with a space and non-ASCII characters: install, doctor, check, serve, uninstall
+          - { gate: G5, scenario: profile-paths, os: windows-latest, plat: windows-x64 }
+          - { gate: G5, scenario: profile-paths, os: ubuntu-latest, plat: linux-x64 }
+          - { gate: G5, scenario: profile-paths, os: macos-14, plat: macos-arm64 }
+          # G6 + G7 (S11-S13, S15, S16): offline start; macOS quarantine; Linux headless, read-only and full disk
+          - { gate: G6+G7, scenario: offline, os: windows-latest, plat: windows-x64 }
+          - { gate: G6+G7, scenario: offline, os: ubuntu-latest, plat: linux-x64 }
+          - { gate: G6+G7, scenario: offline, os: macos-14, plat: macos-arm64 }
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with: { sparse-checkout: .github/scenarios, persist-credentials: false }
+      - id: f
+        shell: bash
+        env:
+          ONLY: ${{ inputs.only }}
+        run: |
+          only=$ONLY; [ "${{ github.event_name }}" = push ] && only=$(cat .github/scenarios/dev_only.txt 2> /dev/null || true)
+          case " $only " in "  "|*" ${{ matrix.scenario }} "*|*" ${{ matrix.scenario }}@${{ matrix.plat }} "*) echo "run=true" >> "$GITHUB_OUTPUT";; *) echo "run=false" >> "$GITHUB_OUTPUT"; echo "not selected";; esac
+      - name: This build (from this run)
+        if: ${{ steps.f.outputs.run == 'true' && env.ART == '' }}
+        uses: actions/download-artifact@v4
+        with: { pattern: "release-{common,${{ matrix.plat }}}", path: dist, merge-multiple: true }
+      - name: This build (from run ${{ env.ART }})
+        if: ${{ steps.f.outputs.run == 'true' && env.ART != '' }}
+        uses: actions/download-artifact@v4
+        with: { pattern: "release-{common,${{ matrix.plat }}}", path: dist, merge-multiple: true, run-id: "${{ env.ART }}", github-token: "${{ github.token }}" }
+      - name: ${{ matrix.scenario }}
+        if: steps.f.outputs.run == 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASES_REPO: ${{ github.repository }}
+          N: ${{ env.VER }}
+          PLAT: ${{ matrix.plat }}
+        run: |
+          export DIST="$GITHUB_WORKSPACE/dist"
+          ls -l "$DIST"
+          export PREV=$(gh release list --repo "$RELEASES_REPO" --exclude-drafts --exclude-pre-releases --limit 10 --json tagName -q '.[].tagName' | { grep -vx "$N" || true; } | head -1)
+          bash .github/scenarios/scenario.sh "${{ matrix.scenario }}"
