@@ -5,12 +5,15 @@
   probe.py version <port>        the version that port serves (exit 1 if none)
   probe.py page <port>           exit 0 when / is the app's page
   probe.py field <json file> <key>[.<key>...]   one value of a JSON file ('' when missing)
+  probe.py watch <status.json> <state> <latest> <s>   until status.json has that state and latest; prints its message
   probe.py listen <port>         a foreign program: an HTTP server on 127.0.0.1:<port> that answers 404 to everything
 """
+import concurrent.futures
 import http.server
 import json
 import os
 import sys
+import time
 import urllib.request
 
 OPEN = urllib.request.build_opener(urllib.request.ProxyHandler({}))
@@ -30,6 +33,13 @@ def health(port):
         return None
 
 
+def scan():
+    """{port: workspace} of every Shaft Analyser on 8765..8784, probed side by side (on Windows a closed port takes
+    about 2 s to refuse)"""
+    with concurrent.futures.ThreadPoolExecutor(len(PORTS)) as ex:
+        return {p: ws for p, ws in zip(PORTS, ex.map(health, PORTS)) if ws}
+
+
 def norm(p):
     return os.path.normcase(os.path.realpath(os.path.abspath(p)))
 
@@ -44,15 +54,12 @@ def version(port):
 cmd = sys.argv[1]
 if cmd == "ours":
     want = norm(sys.argv[2])
-    for p in PORTS:
-        ws = health(p)
-        if ws and norm(ws) == want:
+    for p, ws in sorted(scan().items()):
+        if norm(ws) == want:
             print(p, version(p))
 elif cmd == "all":
-    for p in PORTS:
-        ws = health(p)
-        if ws:
-            print(p, ws)
+    for p, ws in sorted(scan().items()):
+        print(p, ws)
 elif cmd == "version":
     v = version(int(sys.argv[2]))
     print(v)
@@ -70,6 +77,18 @@ elif cmd == "field":
         print("" if v is None else v)
     except Exception:
         print("")
+elif cmd == "watch":   # watch <status.json> <state> <latest> <seconds>: until it says so; prints its message
+    end = time.time() + float(sys.argv[5])
+    while time.time() < end:
+        try:
+            st = json.load(open(sys.argv[2], encoding="utf-8"))
+            if st.get("state") == sys.argv[3] and st.get("latest") == sys.argv[4]:
+                print(st.get("message", ""))
+                sys.exit(0)
+        except Exception:
+            pass
+        time.sleep(0.1)
+    sys.exit(1)
 elif cmd == "listen":
     class H(http.server.BaseHTTPRequestHandler):
         def do_GET(self):

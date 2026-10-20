@@ -18,6 +18,7 @@ ok() { say "ok: $*"; }
 wp() { if $WIN; then cygpath -w "$1"; else printf '%s' "$1"; fi; }
 up() { if $WIN; then cygpath -u "$1"; else printf '%s' "$1"; fi; }
 probe() { "$PY" -I "$(wp "$HERE/probe.py")" "$@"; }
+field() { probe field "$(wp "$1")" "$2"; }   # one value of a JSON file
 exe_of() { if $WIN; then echo "$1/shaft-analyser.exe"; else echo "$1/shaft-analyser"; fi; }
 
 # ---- the release servers -------------------------------------------------------------------------------------------
@@ -37,14 +38,14 @@ serve_this() { serve "$DIST" "$N" 8011; }
 # one_liner <home> <release url> <log>: the documented one-line install into <home>, not starting the app.
 # Exit status: the installer's (install.ps1 under `irm | iex` exits 0 even when it fails: its message counts).
 one_liner() {
-  local home=$1 base=$2 log=$3 rc=0 sh_home
+  local home=$1 base=$2 log=$3 rc=0 sh_home script=${ONE_LINER_SCRIPT_BASE:-$2}   # (the installer itself from elsewhere)
   sh_home=$(wp "$home"); [ "${ONE_LINER_DEFAULT_HOME:-}" = 1 ] && sh_home=""   # the installer's own default folder
   if $WIN; then
     SHAFT_HOME="$sh_home" SHAFT_RELEASE_URL="$base" SHAFT_NO_START=1 \
-      powershell -NoProfile -ExecutionPolicy Bypass -Command "irm $base/install.ps1 | iex" > "$log" 2>&1 || rc=$?
+      powershell -NoProfile -ExecutionPolicy Bypass -Command "irm $script/install.ps1 | iex" > "$log" 2>&1 || rc=$?
     grep -q "shaft-analyser install failed" "$log" && rc=${rc/#0/1}
   else
-    { curl -fsSL "$base/install.sh" | SHAFT_HOME="$sh_home" SHAFT_RELEASE_URL="$base" SHAFT_NO_START=1 sh; } > "$log" 2>&1 || rc=$?
+    { curl -fsSL "$script/install.sh" | SHAFT_HOME="$sh_home" SHAFT_RELEASE_URL="$base" SHAFT_NO_START=1 sh; } > "$log" 2>&1 || rc=$?
   fi
   sed 's/^/    install| /' "$log"
   return $rc
@@ -71,8 +72,8 @@ alive() { kill -0 "$1" 2> /dev/null; }
 ours() { probe ours "$(wp "$1/workspace")"; }
 # wait_up <home> <seconds>: until this install serves; prints the port
 wait_up() {
-  local i out
-  for i in $(seq "$2"); do
+  local end=$((SECONDS + $2)) out
+  while [ $SECONDS -lt $end ]; do
     out=$(ours "$1"); [ -n "$out" ] && { echo "$out" | head -1 | cut -d' ' -f1; return 0; }
     sleep 1
   done
@@ -80,8 +81,8 @@ wait_up() {
 }
 # wait_version <home> <version> <seconds>: until this install serves <version>; prints the port
 wait_version() {
-  local i out
-  for i in $(seq "$3"); do
+  local end=$((SECONDS + $3)) out
+  while [ $SECONDS -lt $end ]; do
     out=$(ours "$1" | awk -v v="$2" '$2 == v {print $1; exit}'); [ -n "$out" ] && { echo "$out"; return 0; }
     sleep 1
   done
@@ -107,6 +108,21 @@ dummy_listener() {   # a foreign program on <port>
   DUMMY=$!; SA_PIDS+=($!)
   for _ in $(seq 50); do [ "$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$1/api/health")" = 404 ] && { say "foreign listener on $1 (pid $DUMMY)"; return 0; }; sleep 0.2; done
   fail "the foreign listener on $1 did not come up"
+}
+
+# listener_start <port>: when (unix seconds) the process listening on 127.0.0.1:<port> started ('' if none)
+listener_start() {
+  local pid et
+  if $WIN; then
+    powershell -NoProfile -Command "\$c = Get-NetTCPConnection -LocalPort $1 -State Listen -ErrorAction SilentlyContinue | Select-Object -First 1;
+      if (\$c) { [DateTimeOffset]::new((Get-Process -Id \$c.OwningProcess).StartTime).ToUnixTimeSeconds() }" 2> /dev/null | tr -d '\r'
+    return 0
+  fi
+  if [ "$RUNNER_OS" = macOS ]; then pid=$(lsof -nP -t -iTCP:"$1" -sTCP:LISTEN 2> /dev/null | head -1)
+  else pid=$(ss -ltnpH "sport = :$1" 2> /dev/null | grep -o 'pid=[0-9]*' | head -1 | cut -d= -f2); fi
+  [ -n "$pid" ] || return 0
+  et=$(ps -o etime= -p "$pid" | tr -d ' ')   # [[dd-]hh:]mm:ss
+  "$PY" -I -c "import sys,time; e=sys.argv[1]; d,_,e=e.rpartition('-'); p=[int(x) for x in e.split(':')]; p=[0]*(3-len(p))+p; print(int(time.time())-((int(d or 0)*24+p[0])*60+p[1])*60-p[2])" "$et"
 }
 
 # ---- diagnostics on failure -----------------------------------------------------------------------------------------

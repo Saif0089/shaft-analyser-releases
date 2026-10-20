@@ -6,8 +6,8 @@
 #   self-update-holders  Windows. The previous release, running, updates itself to this build while an orphaned
 #                        Python of its own (.tools) and a foreign program (cmd.exe, and a process holding a file open)
 #                        work in its app folder (app-<prev>\backend). Must install: this build serves.
-#   self-update / self-update-export   the same, with families + segmented-cloud exports running when the update
-#                        arrives: the update waits for them; they finish whole, not interrupted (the release gate).
+#   self-update / self-update-export   the same, with the segmented-cloud export running when the update arrives:
+#                        the update waits for it; it finishes whole, not interrupted (the release gate).
 #   legacy-orphan        Windows, Darryl's case. v0.3.7's full zip (the old app\ layout), started; its launcher dies
 #                        and leaves its uv and Python serving from app\backend (plus an orphaned worker there). This
 #                        build's one-liner, then a start: this build serves, alone, the workspace is kept.
@@ -94,9 +94,9 @@ self_update() {   # self-update-holders / self-update-export (Windows)
   fi
   port=$(wait_version "$H" "$N" 480) || fail "$PREV did not update itself to $N with $(basename "$app")\\backend held"
   holders_alive "$app/backend"
-  local st i; for i in $(seq 20); do st=$(probe field "$H/updates/status.json" state); [ "$st" = updated ] || [ "$st" = current ] && break; sleep 1; done
+  local st i; for i in $(seq 20); do st=$(field "$H/updates/status.json" state); [ "$st" = updated ] || [ "$st" = current ] && break; sleep 1; done
   [ "$st" = updated ] || [ "$st" = current ] || fail "status.json state is '$st', expected updated"
-  [ "$(probe field "$H/updates/status.json" current)" = "$N" ] || fail "status.json current is not $N"
+  [ "$(field "$H/updates/status.json" current)" = "$N" ] || fail "status.json current is not $N"
   [ "$(tr -d '[:space:]' < "$H/app.current")" = "app-$N" ] || fail "app.current is '$(cat "$H/app.current")', expected app-$N"
   "$(exe_of "$H")" version | grep -F "$N" || fail "the launcher was not replaced by $N's"
   exactly_one "$H"; shaft_kept "$H"
@@ -135,20 +135,28 @@ legacy() {   # legacy-orphan / legacy-foreign (Windows)
 }
 
 running_case() {   # running_case <home>: 8765 held by another program (moved) or not
-  local H=$1 moved=false port
+  local H=$1 moved=false port0 port old new
   [ "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8765/api/health)" = 404 ] && moved=true
   install_prev "$H"; plant_shaft "$H"
-  SHAFT_AUTO_UPDATE=0 launch "prev-$(basename "$H")" "$(exe_of "$H")" start --no-browser
-  port=$(wait_up "$H" $UP) || fail "$PREV did not come up"
-  if $moved; then [ "$port" != 8765 ] || fail "$PREV took 8765 although it is held"; fi
-  ok "$PREV running from $H on $port"
-  one_liner "$H" "$(this_base)" "$LOGS/install-this-$(basename "$H").log" \
-    || fail "the one-liner failed while $PREV was running on $port"
-  SHAFT_AUTO_UPDATE=0 launch "new-$(basename "$H")" "$(exe_of "$H")" start --no-browser
+  SHAFT_AUTO_UPDATE=0 launch "prev-$(basename "$(dirname "$H")")" "$(exe_of "$H")" start --no-browser; old=$LAUNCHED
+  port0=$(wait_up "$H" $UP) || fail "$PREV did not come up"
+  if $moved; then [ "$port0" != 8765 ] || fail "$PREV took 8765 although it is held"; fi
+  ok "$PREV running from $H on $port0 (launcher pid $old)"
+  local t0; t0=$(date +%s)
+  one_liner "$H" "$(this_base)" "$LOGS/install-this-$(basename "$(dirname "$H")").log" \
+    || fail "the one-liner failed while $PREV was running on $port0"
+  SHAFT_AUTO_UPDATE=0 launch "new-$(basename "$(dirname "$H")")" "$(exe_of "$H")" start --no-browser; new=$LAUNCHED
   port=$(wait_version "$H" "$N" $UP) \
-    || fail "after the one-liner (run while $PREV served on $port) the install does not serve $N; it serves: $(ours "$H" | tr '\n' ';') (installer: $(grep -iE 'running|close|failed' "$LOGS/install-this-$(basename "$H").log" | head -2 | tr '\n' ' '))"
+    || fail "after the one-liner (run while $PREV served on $port0) the install does not serve $N; it serves: $(ours "$H" | tr '\n' ';') (installer: $(grep -iE 'running|close|failed' "$LOGS/install-this-$(basename "$(dirname "$H")").log" | head -2 | tr '\n' ' '))"
+  # an old app whose files were replaced under it reports the new VERSION from disk: settle, then judge processes
+  sleep 15
   exactly_one "$H"; shaft_kept "$H"
-  ok "one-liner while $PREV ran on $port: $N serves on $port"
+  port=$(ours "$H" | head -1 | cut -d' ' -f1)
+  local ts; ts=$(listener_start "$port")
+  say "the backend on $port started at $ts; the one-liner started at $t0"
+  [ -n "$ts" ] && [ "$ts" -ge "$t0" ] || fail "the backend serving the install on $port is $PREV's, started before the one-liner (its files were replaced under it, so it reports $N): the old app was never stopped"
+  alive "$new" || probe version "$port" > /dev/null || fail "nothing serves after the new launch"
+  ok "one-liner while $PREV ran on $port0: $PREV stopped, $N serves on $port"
 }
 running() {   # both cases, each reported (a subshell each: its failure prints its diagnostics and ends only it)
   local r1=0 r2=0
@@ -160,8 +168,8 @@ running() {   # both cases, each reported (a subshell each: its failure prints i
   [ "$r1" = 0 ] && [ "$r2" = 0 ] || fail "one-liner while the previous release runs: moved port $([ $r1 = 0 ] && echo passed || echo FAILED), 8765 $([ $r2 = 0 ] && echo passed || echo FAILED)"
 }
 
-single_instance() {
-  local H="$T/single/ShaftAnalyser" port a b c
+single_instance() {   # both launch patterns are judged, each problem reported, then the scenario fails if any
+  local H="$T/single/ShaftAnalyser" port a b c probs=()
   serve_this; install_this "$H"; plant_shaft "$H"
   dummy_listener 8765
   SHAFT_AUTO_UPDATE=0 launch first "$(exe_of "$H")" start --no-browser; a=$LAUNCHED
@@ -172,17 +180,25 @@ single_instance() {
   wait_exit "$b" 90; local rb=$RC ra=124
   if [ "$rb" = 124 ]; then wait_exit "$a" 5; ra=$RC; fi
   if [ "$rb" = 124 ] && [ "$ra" = 124 ]; then
-    fail "two launches 0.3 s apart both kept running: $(ours "$H" | wc -l | tr -d ' ') backends ($(ours "$H" | tr '\n' ';'))"
+    probs+=("S6: two launches 0.3 s apart both kept running ($(ours "$H" | tr '\n' ';'))")
+  else
+    local rsecond=$rb; [ "$rb" = 124 ] && rsecond=$ra
+    [ "$rsecond" = 0 ] || probs+=("S6: of two launches 0.3 s apart the second exited $rsecond, not 0 ('already running'): $(grep -iE 'error|already' "$LOGS/second.log" "$LOGS/first.log" | head -2 | tr '\n' ' ')")
   fi
-  local rsecond=$rb; [ "$rb" = 124 ] && rsecond=$ra
-  [ "$rsecond" = 0 ] || fail "the launch that lost the race exited $rsecond (expected 0: 'already running')"
+  port=$(wait_up "$H" 30) || fail "nothing serves the install after the first two launches"
   sleep 10
   SHAFT_AUTO_UPDATE=0 launch third "$(exe_of "$H")" start --no-browser; c=$LAUNCHED
   wait_exit "$c" 90
-  [ "$RC" != 124 ] || fail "a third launch 10 s later kept running: backends $(ours "$H" | tr '\n' ';')"
-  [ "$RC" = 0 ] || fail "the third launch exited $RC (expected 0)"
-  grep -F "127.0.0.1:$port" "$LOGS/third.log" || fail "the third launch did not name the running app's URL http://127.0.0.1:$port"
-  exactly_one "$H"
+  if [ "$RC" = 124 ]; then probs+=("S5: a launch 10 s later kept running: a second backend ($(ours "$H" | tr '\n' ';'))")
+  elif [ "$RC" != 0 ]; then probs+=("S5: a launch 10 s later exited $RC, not 0")
+  elif ! grep -qF "127.0.0.1:$port" "$LOGS/third.log"; then probs+=("S5: a launch 10 s later did not name the running app's URL http://127.0.0.1:$port")
+  fi
+  local n; n=$(ours "$H" | grep -c . || true)
+  [ "$n" = 1 ] || probs+=("$n backends serve the install's workspace at the end: $(ours "$H" | tr '\n' ';')")
+  if [ ${#probs[@]} -gt 0 ]; then
+    local p; for p in "${probs[@]}"; do printf '::error::single-instance: %s\n' "$p"; done
+    fail "${#probs[@]} problem(s): ${probs[*]}"
+  fi
   ok "one backend on $port; the later launches said so and exited 0"
 }
 
@@ -210,6 +226,12 @@ profile_paths() {
   kill_tree "$a"; sleep 3
   "$(exe_of "$H")" uninstall | tee "$LOGS/uninstall.log" || fail "uninstall failed"
   local i; for i in $(seq 30); do [ -e "$(exe_of "$H")" ] || break; sleep 1; done
+  if [ -e "$(exe_of "$H")" ] && $WIN; then   # is it the path? the same self-delete from an ASCII folder, for the record
+    local C=/c/sa-control/ShaftAnalyser; mkdir -p "$C"; cp "$(exe_of "$H")" "$C/"
+    "$C/shaft-analyser.exe" uninstall > /dev/null 2>&1 || true
+    for i in $(seq 15); do [ -e "$C/shaft-analyser.exe" ] || break; sleep 1; done
+    say "control: uninstall from C:\\sa-control\\ShaftAnalyser $([ -e "$C/shaft-analyser.exe" ] && echo 'ALSO left the program' || echo 'removed the program')"
+  fi
   [ ! -e "$(exe_of "$H")" ] || fail "uninstall left the program $(exe_of "$H")"
   for d in .tools updates sample_input "app-$N" app app.current; do [ ! -e "$H/$d" ] || fail "uninstall left $d"; done
   shaft_kept "$H"
@@ -242,8 +264,8 @@ while True:
   sleep 30
   alive "$a" || fail "the launcher exited while offline"
   [ -s "$LOGS/proxy.log" ] || fail "the update check never went to the proxy (the scenario would prove nothing)"
-  local st; st=$(probe field "$H/updates/status.json" state)
-  [ "$st" != error ] || fail "offline, status.json says error: $(probe field "$H/updates/status.json" message)"
+  local st; st=$(field "$H/updates/status.json" state)
+  [ "$st" != error ] || fail "offline, status.json says error: $(field "$H/updates/status.json" message)"
   probe version "$port" > /dev/null || fail "the app stopped answering"
   ok "offline: serves $N on $port; $(wc -l < "$LOGS/proxy.log" | tr -d ' ') update checks refused by the proxy, status '${st:-none}'"
   [ "$RUNNER_OS" = macOS ] && quarantine_cleared "$H"
@@ -287,20 +309,14 @@ with zipfile.ZipFile(src) as zi, zipfile.ZipFile(dst + '/shaft-analyser-app.zip'
 h = hashlib.sha256(open(dst + '/shaft-analyser-app.zip', 'rb').read()).hexdigest()
 open(dst + '/checksums.txt', 'w').write(h + '  shaft-analyser-app.zip\n')
 " "$(wp "$DIST/shaft-analyser-app.zip")" "$(wp "$B")"
-  serve "$B" v9.9.9 8012
+  serve "$B" v9.9.9 8012 --gate "$(wp "$T/allow-broken")"
   SHAFT_UPDATE_BASE=http://127.0.0.1:8012 SHAFT_UPDATE_CHECK_S=10 launch rb "$(exe_of "$H")" start --no-browser
   local a=$LAUNCHED
   port=$(wait_version "$H" "$N" $UP) || fail "$N did not come up"
   ok "$N serves on $port; v9.9.9 (broken) is the newest release"
-  local i seen_err="" msg=""
-  for i in $(seq 900); do   # up to 7.5 min: download, install, its start fails, roll back
-    if [ "$(probe field "$H/updates/status.json" state)" = error ] && [ "$(probe field "$H/updates/status.json" latest)" = v9.9.9 ]; then
-      seen_err=yes; msg=$(probe field "$H/updates/status.json" message); break
-    fi
-    alive "$a" || fail "the launcher exited during the bad update"
-    sleep 0.5
-  done
-  [ -n "$seen_err" ] || fail "no error status for v9.9.9 within 7.5 min"
+  touch "$T/allow-broken"; say "v9.9.9 offered: /latest -> v9.9.9"
+  local msg   # the error status lasts until the next update check (~10 s): watched every 0.1 s
+  msg=$(probe watch "$(wp "$H/updates/status.json")" error v9.9.9 450) || { alive "$a" || fail "the launcher exited during the bad update"; fail "no error status for v9.9.9 within 7.5 min"; }
   grep -q "Installed v9.9.9" "$LOGS/rb.log" || fail "the launcher never installed v9.9.9 (the scenario would prove nothing)"
   ok "error status: $msg"
   port=$(wait_version "$H" "$N" $UP) || fail "after the roll back $N does not serve again (serves: $(ours "$H" | tr '\n' ';'))"
@@ -322,7 +338,7 @@ bad_downloads() {
   for mode in truncate flip html; do
     port=$((port + 1))
     serve "$DIST" "$N" "$port" --mode "$mode"
-    rc=0; one_liner "$H" "http://127.0.0.1:$port/download/$N" "$LOGS/install-$mode.log" || rc=$?
+    rc=0; ONE_LINER_SCRIPT_BASE="$(this_base)" one_liner "$H" "http://127.0.0.1:$port/download/$N" "$LOGS/install-$mode.log" || rc=$?
     [ "$rc" != 0 ] || fail "the one-liner reported success with a $mode download"
     [ "$(snapshot "$H")" = "$before" ] || fail "the one-liner with a $mode download changed the install"
     ok "one-liner, $mode download: refused (exit $rc: $(grep -iE 'checksum|cannot|no package|fail' "$LOGS/install-$mode.log" | head -1)), install untouched"

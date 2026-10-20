@@ -1,9 +1,9 @@
 """A real job through the app's API, as an engineer runs it (release CI scenarios; stdlib only, no proxy).
 
   job.py <port> <sample.laz> <state dir> start   new shaft, add the scan, ingest -> audit -> layout -> qc (proceed on
-                                                RED), confirm the layout, segmentation; then starts the families and
-                                                segmented-cloud exports and returns while they run (<state dir>/scan)
-  job.py <port> <sample.laz> <state dir> finish  waits for both exports (the app may restart in between: an update),
+                                                RED), confirm the layout, segmentation; then starts the segmented-cloud
+                                                export and returns while it runs (<state dir>/scan)
+  job.py <port> <sample.laz> <state dir> finish  waits for the export (the app may restart in between: an update),
                                                 then checks they are done, not interrupted, and segmented.laz is whole
 
 The port can change across an update only if the launcher moves; finish re-reads it from <state dir>/port when present.
@@ -75,8 +75,7 @@ if step == "start":
         call("POST", "/scans/%s/decision" % scid, {"choice": "proceed", "note": "CI"})
     call("POST", "/scans/%s/layout/confirm" % scid)
     wait(scid, "segment")
-    call("POST", "/scans/%s/exports/families" % scid)
-    call("POST", "/scans/%s/exports/simple" % scid)
+    call("POST", "/scans/%s/exports/simple" % scid)   # one export at a time per scan: the segmented cloud (Darryl's)
     busy = [j for j in call("GET", "/jobs") if j.get("status") in ("queued", "running")]
     log("exports started; jobs queued or running: %d" % len(busy))
     if not busy:
@@ -85,7 +84,6 @@ elif step == "finish":
     scid = open(os.path.join(state, "scan")).read().strip()
     if os.path.exists(os.path.join(state, "port")):
         port = int(open(os.path.join(state, "port")).read().strip())
-    wait(scid, "export_families", allow_down=True)
     wait(scid, "export_simple", allow_down=True)
     def retry(*a, **k):   # the app restarts once more when the update installs right after the exports
         for i in range(90):
