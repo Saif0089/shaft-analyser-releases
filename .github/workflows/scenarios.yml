@@ -15,9 +15,6 @@ on:
       artifacts_run: { description: "id of a release.yml run whose build artifacts are tested", required: true }
       version: { description: "the version that run built (vX.Y.Z)", required: true }
       only: { description: "only these scenarios (space separated; empty: all)", default: "" }
-  push:   # DEV ONLY (removed before merge): iterate on the scenarios against run 39335459198's v0.3.10 build
-    branches: [ci/scenarios]
-    paths: [".github/scenarios/**", ".github/workflows/scenarios.yml"]
 
 run-name: ${{ github.event_name == 'workflow_dispatch' && format('scenarios {0} of run {1} {2}', inputs.version, inputs.artifacts_run, inputs.only) || 'scenarios' }}
 
@@ -26,8 +23,8 @@ permissions:
   actions: read
 
 env:
-  ART: ${{ inputs.artifacts_run || (github.event_name == 'push' && '39335459198' || '') }}
-  VER: ${{ inputs.version || (github.event_name == 'push' && 'v0.3.10' || '') }}
+  ART: ${{ inputs.artifacts_run }}
+  VER: ${{ inputs.version }}
 
 jobs:
   scenario:
@@ -69,7 +66,7 @@ jobs:
         env:
           ONLY: ${{ inputs.only }}
         run: |
-          only=$ONLY; [ "${{ github.event_name }}" = push ] && only=$(cat .github/scenarios/dev_only.txt 2> /dev/null || true)
+          only=$ONLY
           case " $only " in "  "|*" ${{ matrix.scenario }} "*|*" ${{ matrix.scenario }}@${{ matrix.plat }} "*) echo "run=true" >> "$GITHUB_OUTPUT";; *) echo "run=false" >> "$GITHUB_OUTPUT"; echo "not selected";; esac
       - name: This build (from this run)
         if: ${{ steps.f.outputs.run == 'true' && env.ART == '' }}
