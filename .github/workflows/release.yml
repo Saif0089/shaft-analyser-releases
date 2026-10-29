@@ -100,7 +100,11 @@ jobs:
         run: uv sync --python 3.12 --frozen && uv run pytest -q
       - name: Launcher tests
         working-directory: launcher
-        run: go vet ./... && go test ./...
+        # CI is set on purpose: the Windows tests that change the registry, PATH and shortcuts (install.ps1, the
+        # Known Folders search, app-* folders) skip without it. -count=1: never a cached pass.
+        env:
+          CI: "true"
+        run: go vet ./... && go test -count=1 ./...
 
   build:
     # alongside the unit tests (publish needs both)
@@ -134,7 +138,8 @@ jobs:
         run: |
           web() {
             cd frontend
-            npm ci && npm run build
+            # the web app's tests and lint come before its build: a failure here blocks the release
+            npm ci && npm test && npm run lint && npm run build
           }
           launchers() {
             cd launcher
@@ -191,7 +196,7 @@ jobs:
         with: { name: release-macos-arm64, path: dist/ShaftAnalyser-*-macos-arm64.zip, retention-days: 14, compression-level: 0, if-no-files-found: error }
 
   verify:
-    needs: build
+    needs: [decide, build]
     strategy:
       fail-fast: false
       matrix:
@@ -263,6 +268,35 @@ jobs:
           for i in $(seq 120); do curl -sf http://127.0.0.1:8765/api/health && break; sleep 2; done
           curl -sf http://127.0.0.1:8765/ | grep -q "Shaft Analyser"
           curl -sf http://127.0.0.1:8765/api/version | grep -q "${{ needs.build.outputs.version }}"
+      # SC-012: the click, Inspect and Back flow, untimed, on the synthetic kink shaft the self-check just processed.
+      # tools/m7/flow.py needs only a Python and Playwright; it drives the runner's own Chrome (Edge on Windows) and
+      # --adopt registers the self-check's scan in this install's workspace (a client's app never lists it by itself).
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ needs.decide.outputs.sha }}
+          token: ${{ secrets.SOURCE_TOKEN }}
+          path: source
+          sparse-checkout: tools/m7
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - name: The click, Inspect and Back flow on the synthetic kink shaft (SC-012)
+        shell: bash
+        run: |
+          H="$HOME"; [ "$RUNNER_OS" = Windows ] && H="$(cygpath -m "$USERPROFILE")"
+          # the app started above keeps running; if the runner ended it with that step, start it again
+          curl -sf http://127.0.0.1:8765/api/health > /dev/null || { "$SA" start --no-browser > serve-flow.log 2>&1 & }
+          for i in $(seq 120); do curl -sf http://127.0.0.1:8765/api/health > /dev/null && break; sleep 2; done
+          curl -sf http://127.0.0.1:8765/api/health > /dev/null
+          python -m pip install --quiet playwright==1.64.1
+          python source/tools/m7/flow.py --adopt "$H/ShaftAnalyser/workspace/self_check/scan" --report flow-report/flow.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: flow-${{ matrix.plat }}
+          path: flow-report/flow.json
+          if-no-files-found: warn
       - uses: actions/upload-artifact@v4
         if: always()
         with:
