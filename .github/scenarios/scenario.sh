@@ -380,12 +380,15 @@ quarantine_cleared() {
 }
 
 headless() {   # headless <home>: an installed copy started with browser and notifications on, no desktop
-  local H=$1 port bin="$T/bin"
+  local H=$1 port bin="$T/bin" d f p
   mkdir -p "$bin"
   for d in /usr/local/bin /usr/bin /bin; do
     for f in "$d"/*; do
       case "$(basename "$f")" in xdg-open|notify-send|x-www-browser|www-browser|sensible-browser|gio|firefox|google-chrome*|chromium*|microsoft-edge*) continue;; esac
-      [ -e "$bin/$(basename "$f")" ] || ln -s "$f" "$bin/$(basename "$f")"
+      p="$bin/$(basename "$f")"
+      # (-L as well as -e: a dangling link, like grub-ntldr-img in ubuntu-26.04's /usr/bin, is a link that exists but
+      # fails -e; /bin is /usr/bin, so every name is met twice)
+      [ -e "$p" ] || [ -L "$p" ] || ln -s "$f" "$p"
     done
   done
   if PATH="$bin" command -v xdg-open > /dev/null; then fail "xdg-open still on the PATH"; fi
