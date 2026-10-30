@@ -97,7 +97,22 @@ jobs:
         with: { go-version: "1.24", cache-dependency-path: launcher/go.mod }
       - name: Backend unit tests
         working-directory: backend
-        run: uv sync --python 3.12 --frozen && uv run pytest -q
+        # On macos-15 runners the tools' own stand-in server (tests/test_m7_driver.py: a plain http.server that the
+        # tools' Server class starts and stops) never answers on 127.0.0.1 (release run 41106476241, 30 Oct). Those five
+        # tests check the test tools, not the app; they run here on Linux, and the packaged app's own server runs on
+        # macos-15 in verify, update-e2e and the scenarios.
+        run: |
+          uv sync --python 3.12 --frozen
+          if [ "$RUNNER_OS" = macOS ]; then
+            uv run pytest -q \
+              --deselect tests/test_m7_driver.py::test_stop_forces_a_server_that_waits_on_its_connections \
+              --deselect tests/test_m7_driver.py::test_stop_kills_a_server_that_ignores_every_signal \
+              --deselect tests/test_m7_driver.py::test_stop_ends_the_workers_a_server_leaves_behind \
+              --deselect tests/test_m7_driver.py::test_stop_carries_on_when_the_system_refuses_a_signal \
+              --deselect tests/test_m7_driver.py::test_start_refuses_a_server_of_another_workspace
+          else
+            uv run pytest -q
+          fi
       - name: Launcher tests
         working-directory: launcher
         # CI is set on purpose: the Windows tests that change the registry, PATH and shortcuts (install.ps1, the
