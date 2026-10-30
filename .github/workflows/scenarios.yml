@@ -40,22 +40,22 @@ jobs:
           # G2 (S4): the one-liner while the previous release runs, on 8765 and on a moved port
           - { gate: G2, scenario: running, os: windows-latest, plat: windows-x64 }
           - { gate: G2, scenario: running, os: ubuntu-latest, plat: linux-x64 }
-          - { gate: G2, scenario: running, os: macos-14, plat: macos-arm64 }
+          - { gate: G2, scenario: running, os: macos-15, plat: macos-arm64 }
           # G3 (S5/S6): one app per install, 8765 held by another program
           - { gate: G3, scenario: single-instance, os: windows-latest, plat: windows-x64 }
           - { gate: G3, scenario: single-instance, os: ubuntu-latest, plat: linux-x64 }
-          - { gate: G3, scenario: single-instance, os: macos-14, plat: macos-arm64 }
+          - { gate: G3, scenario: single-instance, os: macos-15, plat: macos-arm64 }
           # G4 (S9/S10): a broken next version rolls back; bad downloads change nothing
           - { gate: G4, scenario: rollback, os: windows-latest, plat: windows-x64 }
           - { gate: G4, scenario: rollback, os: ubuntu-latest, plat: linux-x64 }
           # G5 (S7/S8/S14): profile with a space and non-ASCII characters: install, doctor, check, serve, uninstall
           - { gate: G5, scenario: profile-paths, os: windows-latest, plat: windows-x64 }
           - { gate: G5, scenario: profile-paths, os: ubuntu-latest, plat: linux-x64 }
-          - { gate: G5, scenario: profile-paths, os: macos-14, plat: macos-arm64 }
+          - { gate: G5, scenario: profile-paths, os: macos-15, plat: macos-arm64 }
           # G6 + G7 (S11-S13, S15, S16): offline start; macOS quarantine; Linux headless, read-only and full disk
           - { gate: G6+G7, scenario: offline, os: windows-latest, plat: windows-x64 }
           - { gate: G6+G7, scenario: offline, os: ubuntu-latest, plat: linux-x64 }
-          - { gate: G6+G7, scenario: offline, os: macos-14, plat: macos-arm64 }
+          - { gate: G6+G7, scenario: offline, os: macos-15, plat: macos-arm64 }
     runs-on: ${{ matrix.os }}
     timeout-minutes: 25
     steps:

@@ -82,7 +82,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-14]
+        os: [ubuntu-latest, windows-latest, macos-15]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     defaults:
@@ -203,7 +203,7 @@ jobs:
         include:
           - { os: windows-latest, plat: windows-x64, exe: shaft-analyser.exe }
           - { os: ubuntu-latest, plat: linux-x64, exe: shaft-analyser }
-          - { os: macos-14, plat: macos-arm64, exe: shaft-analyser }
+          - { os: macos-15, plat: macos-arm64, exe: shaft-analyser }
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
     env:
@@ -314,7 +314,7 @@ jobs:
         include:
           - { os: windows-latest, plat: windows-x64, exe: shaft-analyser.exe }
           - { os: ubuntu-latest, plat: linux-x64, exe: shaft-analyser }
-          - { os: macos-14, plat: macos-arm64, exe: shaft-analyser }
+          - { os: macos-15, plat: macos-arm64, exe: shaft-analyser }
     runs-on: ${{ matrix.os }}
     timeout-minutes: 40
     env:
